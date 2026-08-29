@@ -6,9 +6,7 @@
 
 ---
 
-## Read this first — the 5-minute version
-
-**One sentence:** balances are a *projection* of an immutable double-entry ledger, every money movement goes through a single Transaction Engine, and that engine's correctness rests on one SQL statement.
+**One sentence:** balances are a _projection_ of an immutable double-entry ledger, every money movement goes through a single Transaction Engine, and that engine's correctness rests on one SQL statement.
 
 **The statement everything depends on:**
 
@@ -24,11 +22,11 @@ Guard and mutation in **one atomic operation**. Application code never holds a b
 
 **The three numbers that must always hold** (checked by SQL views, verified after every demo):
 
-| Invariant | View |
-|---|---|
-| Every ledger entry ever written sums to **0** | `ledger_conservation_check` |
-| Every wallet's balance equals its ledger sum | `wallet_balance_drift` |
-| Every wallet's reserved equals its envelope sum | `wallet_reservation_drift` |
+| Invariant                                       | View                        |
+| ----------------------------------------------- | --------------------------- |
+| Every ledger entry ever written sums to **0**   | `ledger_conservation_check` |
+| Every wallet's balance equals its ledger sum    | `wallet_balance_drift`      |
+| Every wallet's reserved equals its envelope sum | `wallet_reservation_drift`  |
 
 ---
 
@@ -107,7 +105,6 @@ src/
 └── infrastructure/                  L3 — Prisma, Redis, security, health
 ```
 
-**Reading order if you have 20 minutes:**
 1. `transaction.processor.ts` — the whole money path, heavily commented
 2. `prisma-wallet.repository.ts` → `debitIfSufficient` — the statement above
 3. `transaction.state-machine.ts` — why a status field is not enough
@@ -117,22 +114,22 @@ src/
 
 ## The 9 tables
 
-| Table | What it is |
-|---|---|
-| `users` | Identity only. **No money columns at all.** |
-| `wallets` | Balance *projection* + `reserved_poisha` + freeze status |
-| `transactions` | The command record. Idempotency key. Never deleted. |
-| **`ledger_entries`** | **Double-entry postings. THE source of truth.** Immutable. |
-| `transaction_events` | Lifecycle timeline **and** transactional outbox |
-| `money_requests` | A *claim*, never money |
-| `wallet_security_events` | Append-only freeze/unfreeze history |
-| `pots` + `pot_members` | Group collection. The pot **owns a wallet**. |
-| `expense_envelopes` | Reserved capacity. **Moves no money.** |
-| `audit_logs` | Who did what, from where |
-| `risk_flags` | Explainable fraud detections |
+| Table                    | What it is                                                 |
+| ------------------------ | ---------------------------------------------------------- |
+| `users`                  | Identity only. **No money columns at all.**                |
+| `wallets`                | Balance _projection_ + `reserved_poisha` + freeze status   |
+| `transactions`           | The command record. Idempotency key. Never deleted.        |
+| **`ledger_entries`**     | **Double-entry postings. THE source of truth.** Immutable. |
+| `transaction_events`     | Lifecycle timeline **and** transactional outbox            |
+| `money_requests`         | A _claim_, never money                                     |
+| `wallet_security_events` | Append-only freeze/unfreeze history                        |
+| `pots` + `pot_members`   | Group collection. The pot **owns a wallet**.               |
+| `expense_envelopes`      | Reserved capacity. **Moves no money.**                     |
+| `audit_logs`             | Who did what, from where                                   |
+| `risk_flags`             | Explainable fraud detections                               |
 
 **Three append-only logs, three different questions:**
-`ledger_entries` = *where is the money?* · `transaction_events` = *what happened to this movement?* · `audit_logs` = *who did what?*
+`ledger_entries` = _where is the money?_ · `transaction_events` = _what happened to this movement?_ · `audit_logs` = _who did what?_
 
 ---
 
@@ -142,11 +139,11 @@ src/
 
 **2. The ledger is the truth; the balance is a cache.** Every movement writes two signed entries summing to zero. `wallets.balance_poisha` is maintained in the same transaction for O(1) reads. If they ever disagree, the ledger wins and the wallet is frozen.
 
-**3. Pessimistic locks in canonical ID order.** `SELECT … FOR UPDATE ORDER BY id` — sorting removes the *possibility* of a deadlock cycle rather than detecting one after the fact. Two reciprocal transfers serialise instead of one being killed at random.
+**3. Pessimistic locks in canonical ID order.** `SELECT … FOR UPDATE ORDER BY id` — sorting removes the _possibility_ of a deadlock cycle rather than detecting one after the fact. Two reciprocal transfers serialise instead of one being killed at random.
 
 **4. Two-tier idempotency.** Redis `SET NX` absorbs ~99% of duplicate retries; `UNIQUE (initiator_user_id, idempotency_key)` is the **actual guarantee**. Redis can evict, fail over and restart — a unique index cannot. This is why a Redis outage degrades performance but never correctness.
 
-**5. Business rejection ≠ infrastructure fault.** Insufficient funds *commits* a FAILED row (durable evidence) and is never retried. A lock timeout rolls back entirely, releases the idempotency key, and is retried up to 3× with jittered backoff. Conflating them turns one rejected payment into forty retries on a hot row.
+**5. Business rejection ≠ infrastructure fault.** Insufficient funds _commits_ a FAILED row (durable evidence) and is never retried. A lock timeout rolls back entirely, releases the idempotency key, and is retried up to 3× with jittered backoff. Conflating them turns one rejected payment into forty retries on a hot row.
 
 **6. Envelopes reserve capacity, they do not move money.** `spendable = balance − reserved`, enforced by one extra clause in the debit. No ledger entry, no sub-wallet, no new reconciliation.
 
@@ -156,18 +153,18 @@ src/
 
 ## API surface
 
-| | Endpoint |
-|---|---|
-| **Auth** | `POST /auth/register` · `POST /auth/login` |
-| **User** | `GET /users/profile` |
-| **Wallet** | `GET /wallet` · `GET /wallet/balance` · `POST /wallet/send-money` |
-| **Security** | `POST /wallet/freeze` · `POST /wallet/unfreeze` · `GET /wallet/security` |
-| **Transactions** | `GET /transactions` (page/filter/sort) · `GET /transactions/:id` (+ timeline) |
-| **Money requests** | `POST /money-requests` · `:id/accept` · `:id/reject` · `GET /money-requests` |
-| **Envelopes** | `GET|POST /envelopes` · `:id/reserve` · `:id/unlock` · `DELETE :id` |
-| **Pots** | `GET|POST /pots` · `POST /pots/join` · `GET /pots/preview/:code` · `:id/members` · `:id/contribute` · `:id/settle` |
-| **Risk** | `GET /risk-flags` |
-| **Health** | `GET /health/live` · `GET /health/ready` |
+|                    | Endpoint                                                                      |
+| ------------------ | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **Auth**           | `POST /auth/register` · `POST /auth/login`                                    |
+| **User**           | `GET /users/profile`                                                          |
+| **Wallet**         | `GET /wallet` · `GET /wallet/balance` · `POST /wallet/send-money`             |
+| **Security**       | `POST /wallet/freeze` · `POST /wallet/unfreeze` · `GET /wallet/security`      |
+| **Transactions**   | `GET /transactions` (page/filter/sort) · `GET /transactions/:id` (+ timeline) |
+| **Money requests** | `POST /money-requests` · `:id/accept` · `:id/reject` · `GET /money-requests`  |
+| **Envelopes**      | `GET                                                                          | POST /envelopes`·`:id/reserve`·`:id/unlock`·`DELETE :id`                                            |
+| **Pots**           | `GET                                                                          | POST /pots`·`POST /pots/join`·`GET /pots/preview/:code`·`:id/members`·`:id/contribute`·`:id/settle` |
+| **Risk**           | `GET /risk-flags`                                                             |
+| **Health**         | `GET /health/live` · `GET /health/ready`                                      |
 
 Every one is reachable from the UI. `GET /pots/:id` and `/money-requests/pending` exist but the UI uses the list endpoints instead — kept because they are the natural REST shape.
 
@@ -187,18 +184,6 @@ The frontend performs **no** balance arithmetic, **no** transaction rules and **
 
 ---
 
-## Demo script (5 minutes, for judges)
-
-1. **Register** → wallet opens with ৳100,000, *issued* from a genesis account so the ledger sums to zero from row one.
-2. **Envelopes** → reserve ৳50,000 for Rent. Balance unchanged, spendable drops. Try to send more than spendable → refused.
-3. **Send money** → confirm screen shows the idempotency key. Send the same key twice → one charge, same transaction id.
-4. **Transaction detail** → 11 lifecycle events and two ledger postings summing to **0**.
-5. **Pots** → create, share the invite code, others join and chip in. Every contribution is a real engine transfer.
-6. **Security** → freeze the wallet. Outgoing blocked, **incoming still works**. Full history recorded.
-7. **Monitor** → `docker stop redis`; transfers keep succeeding.
-
----
-
 ## Honest limitations
 
 - **Concurrent transfers on one wallet fail above ~4 simultaneous requests** with 503s. Money stays correct (verified: conserved, never negative), but Prisma's interactive-transaction timeout fires under contention. Diagnosed — not lock contention, not pool size, not the libuv threadpool alone — **not yet fixed**.
@@ -210,13 +195,13 @@ The frontend performs **no** balance arithmetic, **no** transaction rules and **
 
 ## Documents
 
-| File | Contents |
-|---|---|
+| File                               | Contents                                                        |
+| ---------------------------------- | --------------------------------------------------------------- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Layers, dependency rule, the transaction engine, scaling to 10M |
-| [DATABASE.md](DATABASE.md) | Schema rationale, indexing, migrations, seeding |
-| [ENGINE.md](ENGINE.md) | The 7 stages, concurrency control, failure handling |
-| [REDIS.md](REDIS.md) | Idempotency, rate limiting, caching, degradation |
-| [web/README.md](web/README.md) | Frontend architecture and API layer |
+| [DATABASE.md](DATABASE.md)         | Schema rationale, indexing, migrations, seeding                 |
+| [ENGINE.md](ENGINE.md)             | The 7 stages, concurrency control, failure handling             |
+| [REDIS.md](REDIS.md)               | Idempotency, rate limiting, caching, degradation                |
+| [web/README.md](web/README.md)     | Frontend architecture and API layer                             |
 
 ---
 
