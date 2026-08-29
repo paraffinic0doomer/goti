@@ -1,0 +1,982 @@
+// ============================================================================
+//  Goti — Prisma schema
+//  Digital money movement platform. NOT a banking system.
+//
+//  Implements the data model approved in ARCHITECTURE.md §6.
+//
+//  NON-NEGOTIABLE RULES ENCODED HERE
+//  ---------------------------------------------------------------------------
+//  1. Money is ALWAYS BigInt poisha. 1 BDT = 100 poisha. Never Float, never
+//     Decimal, never a formatted string. The unit is in every column name.
+//  2. The ledger is the truth. `Wallet.balancePoisha` is a materialised
+//     projection of `LedgerEntry`, kept current inside the same transaction.
+//  3. Nothing that touches money cascades on delete. Every relation is
+//     `onDelete: Restrict`. Financial rows are never removed.
+//  4. IDs are supplied by the application via the `IdGenerator` port
+//     (ARCHITECTURE.md §3, L1). There is deliberately NO `@default(uuid())`
+//     on aggregate roots — see DATABASE.md "Why no UUID default".
+//
+//  WHAT THIS FILE CANNOT EXPRESS
+//  ---------------------------------------------------------------------------
+//  Prisma has no syntax for CHECK constraints, partial indexes, triggers,
+//  column-level grants or row locks. Those live in `prisma/sql/hardening.sql`
+//  and are applied as a `--create-only` migration. The schema is NOT correct
+//  without them. Never run `prisma db push` against a hardened database.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+//  ENUMS
+//
+//  Closed sets that form state machines are PostgreSQL enums: they are compact,
+//  type-checked at the database boundary, and illegal values are unrepresentable.
+//  Open-ended vocabularies (audit actions, risk rule names) are VarChar instead,
+//  because every new value in an enum costs a migration.
+// ============================================================================
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+/// USER wallets are subject to `balance_poisha >= 0`.
+/// SYSTEM wallets (the genesis issuance account) are exempt — their balance is
+/// the negative of all money ever issued, which is what keeps the system-wide
+/// ledger sum at exactly zero.
+enum WalletType {
+  USER
+  /// Holds a group Pot's balance. Subject to the same non-negative CHECK as a
+  /// USER wallet — a pot is real money held on behalf of contributors, so it
+  /// must never be exempt the way the genesis account is.
+  POT
+  SYSTEM
+}
+
+/// The single source of truth for "may this wallet transact?".
+///
+/// Deliberately NOT split into a second `WalletSecurityStatus` table. This
+/// column is already read inside the conditional atomic debit
+/// (`WHERE status = 'ACTIVE'`) and re-checked under the row lock, so it is
+/// enforced at the only two places that matter. A parallel status field would
+/// be a second source of truth that eventually disagrees with this one — and
+/// the disagreement would be invisible until a frozen wallet paid out.
+///
+/// There is no UNFROZEN value: unfreezing returns a wallet to ACTIVE. The
+/// transition itself is recorded in `wallet_security_events`.
+enum WalletStatus {
+  ACTIVE
+  /// User- or system-initiated emergency freeze. Blocks ALL outgoing money.
+  FROZEN
+  /// Held by an analyst pending a risk decision. Blocks outgoing money exactly
+  /// like FROZEN; separate so the queue and the user-facing message differ.
+  UNDER_REVIEW
+  CLOSED
+}
+
+enum TransactionType {
+  P2P_TRANSFER
+  REQUEST_SETTLEMENT
+  GENESIS_ISSUANCE
+  REVERSAL
+  /// A member funding a group Pot. A REAL transfer through the engine, from the
+  /// member's wallet to the Pot's wallet — not a counter increment.
+  POT_CONTRIBUTION
+  /// The Pot's wallet paying out to its creator on settlement.
+  POT_PAYOUT
+}
+
+/// ARCHITECTURE.md §5:
+///   PENDING ─┬─→ COMPLETED ──→ REVERSED
+///            └─→ FAILED
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+/// The fine-grained lifecycle of a money movement.
+///
+/// TWO LEVELS OF STATE, DELIBERATELY
+/// `TransactionStatus` (4 values) is the DURABLE CHECKPOINT on the transaction
+/// row: PENDING, COMPLETED, FAILED, REVERSED. It is what the database trigger
+/// guards and what a reader needs to know.
+///
+/// This enum is the PHASE TIMELINE — every step the engine passed through,
+/// stored as append-only `transaction_events` rows. Promoting these to
+/// `transactions.status` would mean an UPDATE per phase inside the money
+/// transaction, lengthening lock hold time on the hottest rows in the system
+/// for information that belongs in a log. Instead the engine accumulates
+/// phases in memory and writes them in ONE batched insert before commit.
+///
+/// Lifecycle events are written with `publishedAt` already set, so the outbox
+/// worker ignores them. Only COMPLETED / FAILED / REVERSED are left unpublished
+/// and therefore delivered as notifications.
+enum TransactionEventType {
+  TRANSACTION_INITIATED
+  SENDER_VERIFIED
+  RECEIVER_VERIFIED
+  VALIDATION_PASSED
+  WALLETS_LOCKED
+  BALANCE_CHECKED
+  PROCESSING_STARTED
+  SENDER_DEBITED
+  RECEIVER_CREDITED
+  LEDGER_POSTED
+  TRANSACTION_COMPLETED
+  TRANSACTION_FAILED
+  TRANSACTION_REVERSED
+}
+
+/// ARCHITECTURE.md §5: a money request is a claim, not money.
+///   REQUESTED ─┬─→ ACCEPTED  (payer accepts → a Transaction is created)
+///              ├─→ DECLINED
+///              ├─→ CANCELLED
+///              └─→ EXPIRED
+enum MoneyRequestStatus {
+  REQUESTED
+  ACCEPTED
+  DECLINED
+  CANCELLED
+  EXPIRED
+}
+
+enum WalletSecurityAction {
+  FROZEN
+  UNFROZEN
+  MARKED_UNDER_REVIEW
+  REVIEW_CLEARED
+}
+
+enum PotStatus {
+  OPEN
+  /// Target reached. Still accepts contributions unless closed.
+  FUNDED
+  /// Creator closed it; balance paid out. Terminal.
+  SETTLED
+  CANCELLED
+}
+
+enum ActorType {
+  USER
+  SYSTEM
+  ADMIN
+}
+
+enum RiskSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum RiskFlagStatus {
+  OPEN
+  UNDER_REVIEW
+  CONFIRMED
+  DISMISSED
+}
+
+// ============================================================================
+//  USER — identity only
+//
+//  Deliberately holds no money and no balance. Everything financial lives on
+//  Wallet, so that a user record can be edited, suspended or corrected without
+//  any possibility of touching a balance.
+// ============================================================================
+
+model User {
+  /// UUIDv7, supplied by the application's IdGenerator port. Time-ordered so
+  /// that B-tree inserts stay local instead of scattering across the index.
+  id String @id @db.Uuid
+
+  /// Login identity. E.164 (`+8801XXXXXXXXX`). Unique — one account per number.
+  /// This is the handle another user types to send money, so it must resolve
+  /// to exactly one account.
+  phone String @unique @db.VarChar(20)
+
+  /// Shown to the counterparty on a transfer. Not unique — people share names.
+  displayName String @map("display_name") @db.VarChar(80)
+
+  /// Optional secondary contact. Unique when present; PostgreSQL permits many
+  /// NULLs under a unique index, which is exactly the behaviour we want.
+  email String? @unique @db.VarChar(254)
+
+  /// Argon2id hash. Never the password, never a reversible encryption.
+  passwordHash String @map("password_hash") @db.VarChar(255)
+
+  /// Account-level lifecycle. Distinct from WalletStatus: a user can be
+  /// SUSPENDED for policy reasons while their wallet retains a balance that
+  /// must still reconcile.
+  status UserStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  wallet                Wallet?
+  initiatedTransactions Transaction[]         @relation("TransactionInitiator")
+  sentRequests          MoneyRequest[]        @relation("MoneyRequestRequester")
+  receivedRequests      MoneyRequest[]        @relation("MoneyRequestPayer")
+  auditLogs             AuditLog[]            @relation("AuditActor")
+  riskFlags             RiskFlag[]            @relation("RiskSubject")
+  reviewedRiskFlags     RiskFlag[]            @relation("RiskReviewer")
+  frozenWallets         Wallet[]              @relation("WalletFrozenBy")
+  securityActions       WalletSecurityEvent[] @relation("WalletSecurityActor")
+  createdPots           Pot[]                 @relation("PotCreator")
+  potMemberships        PotMember[]           @relation("PotMembership")
+  securityAnswers       SecurityAnswer[]      @relation("SecurityAnswers")
+  securityChallenges    SecurityChallenge[]   @relation("SecurityChallenges")
+
+  /// Admin/ops listing by signup date. Not on any hot path.
+  @@index([createdAt])
+  @@map("users")
+}
+
+// ============================================================================
+//  WALLET — the balance projection
+//
+//  ARCHITECTURE.md §5: `balancePoisha` is NOT the truth. It is a cached sum of
+//  this wallet's LedgerEntry rows, maintained inside the same transaction so
+//  that balance reads stay O(1) instead of scanning the ledger.
+//
+//  Every write to this table goes through the Transaction Engine. No other
+//  code path may update `balancePoisha`.
+// ============================================================================
+
+model Wallet {
+  id String @id @db.Uuid
+
+  /// NULL for SYSTEM wallets, which belong to the platform rather than a person.
+  /// Unique enforces the 1:1 rule at the database level rather than by
+  /// convention — a second wallet for a user is rejected by the constraint,
+  /// not by a code review.
+  userId String? @unique @map("user_id") @db.Uuid
+
+  type WalletType @default(USER)
+
+  /// ISO 4217. Single-currency today, but the column exists so that a
+  /// second currency is a data change rather than a schema migration.
+  /// LedgerEntry carries it too, so a mixed-currency posting is detectable.
+  currency String @default("BDT") @db.Char(3)
+
+  /// Integer poisha. BIGINT holds 9.2e18 — nine quintillion poisha, which is
+  /// beyond any plausible aggregate. Guarded by `CHECK (balance_poisha >= 0
+  /// OR type = 'SYSTEM')` in hardening.sql: the last line of defence from
+  /// ARCHITECTURE.md §5.
+  balancePoisha BigInt @default(0) @map("balance_poisha")
+
+  /// Checked inside the row lock. A FROZEN wallet rejects both debit and
+  /// credit; reconciliation freezes a wallet the moment its ledger and its
+  /// balance disagree.
+  status WalletStatus @default(ACTIVE)
+
+  /// Why this wallet was frozen, shown back to the user so a freeze is never a
+  /// silent lockout. NULL whenever status is ACTIVE.
+  freezeReason   String?   @map("freeze_reason") @db.VarChar(200)
+  frozenAt       DateTime? @map("frozen_at") @db.Timestamptz(6)
+  /// Who froze it. NULL means the system did (a risk rule), which is why this
+  /// is nullable rather than defaulting to the owner.
+  frozenByUserId String?   @map("frozen_by_user_id") @db.Uuid
+
+  /// Sum of every ExpenseEnvelope reservation on this wallet.
+  ///
+  /// A DENORMALISED AGGREGATE, and deliberately so. Spendable balance is
+  /// `balance_poisha - reserved_poisha`, and that subtraction has to happen
+  /// INSIDE the conditional atomic debit — one statement, evaluated by the
+  /// database. Summing envelope rows there instead would turn the hottest
+  /// query in the system into a join with an aggregate, and would reopen the
+  /// read-modify-write race the conditional update exists to close.
+  ///
+  /// Envelopes are the detail; this column is the enforced invariant.
+  /// `hardening.sql` holds it to `0 <= reserved_poisha <= balance_poisha`.
+  reservedPoisha BigInt @default(0) @map("reserved_poisha")
+
+  /// Incremented on every balance change. The conditional atomic update makes
+  /// this unnecessary for correctness, but it gives a cheap concurrent-write
+  /// counter for debugging, and an optimistic-locking handle for the
+  /// non-money paths that do read-modify-write on status.
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user                 User?                 @relation(fields: [userId], references: [id], onDelete: Restrict)
+  frozenBy             User?                 @relation("WalletFrozenBy", fields: [frozenByUserId], references: [id], onDelete: Restrict)
+  securityEvents       WalletSecurityEvent[]
+  envelopes            ExpenseEnvelope[]
+  pot                  Pot?
+  ledgerEntries        LedgerEntry[]
+  outgoingTransactions Transaction[]         @relation("TransactionSource")
+  incomingTransactions Transaction[]         @relation("TransactionDestination")
+
+  // No index on `status`: 99.9% of rows are ACTIVE, so a full index is dead
+  // weight on the hot write path. hardening.sql creates a PARTIAL index
+  // `WHERE status <> 'ACTIVE'` instead, which stays kilobytes at 10M wallets.
+  @@map("wallets")
+}
+
+// ============================================================================
+//  TRANSACTION — the money movement command record
+//
+//  ARCHITECTURE.md calls this `transfers`; renamed to Transaction per the
+//  agreed naming. It records the INTENT and its outcome. It is not the money —
+//  the money is in LedgerEntry.
+//
+//  Rows are NEVER deleted (trigger-enforced). Status changes in place; the
+//  full transition history lives in TransactionEvent.
+// ============================================================================
+
+model Transaction {
+  id String @id @db.Uuid
+
+  /// ARCHITECTURE.md §5 Stage 1. Client-supplied. Combined with the initiator
+  /// under a unique index, this is what makes a retried request a no-op
+  /// instead of a second payment. Deduplication is enforced by the database,
+  /// never by a cache that can race with itself.
+  idempotencyKey String @map("idempotency_key") @db.VarChar(64)
+
+  /// Who asked for this movement. For a settled MoneyRequest this is the
+  /// PAYER (who accepted), not the requester — the payer is the one whose
+  /// money moves, and idempotency must be scoped to them.
+  initiatorUserId String @map("initiator_user_id") @db.Uuid
+
+  /// Distinguishes a peer transfer from a request settlement, a seed issuance
+  /// and a reversal. All four post through the same engine; the type is what
+  /// lets reporting tell them apart without inspecting relations.
+  type TransactionType
+
+  sourceWalletId String @map("source_wallet_id") @db.Uuid
+  destWalletId   String @map("dest_wallet_id") @db.Uuid
+
+  /// Strictly positive; direction is carried by source/dest, not by sign.
+  /// `CHECK (amount_poisha > 0)` in hardening.sql.
+  amountPoisha BigInt @map("amount_poisha")
+
+  currency String @default("BDT") @db.Char(3)
+
+  status TransactionStatus @default(PENDING)
+
+  /// User-supplied memo shown in both parties' history.
+  note String? @db.VarChar(140)
+
+  /// Machine-readable reason on FAILED — `INSUFFICIENT_FUNDS`,
+  /// `WALLET_NOT_ACTIVE`, `REAPED`. A stable code, not a display string, so
+  /// support tooling can aggregate on it.
+  failureReason String? @map("failure_reason") @db.VarChar(64)
+
+  /// Set when this transaction settles a MoneyRequest. UNIQUE, so one request
+  /// can be settled at most once. Held here rather than as
+  /// `MoneyRequest.resultingTransactionId` so a single column owns the link
+  /// and two columns can never disagree.
+  originRequestId String? @unique @map("origin_request_id") @db.Uuid
+
+  /// Set on a REVERSAL, pointing at the transaction being reversed. UNIQUE:
+  /// a transaction may be reversed at most once. A reversal is a NEW pair of
+  /// compensating postings — the original is never mutated.
+  reversalOfId String? @unique @map("reversal_of_id") @db.Uuid
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Set at COMMIT. `CHECK (status <> 'COMPLETED' OR completed_at IS NOT NULL)`.
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  initiator     User          @relation("TransactionInitiator", fields: [initiatorUserId], references: [id], onDelete: Restrict)
+  sourceWallet  Wallet        @relation("TransactionSource", fields: [sourceWalletId], references: [id], onDelete: Restrict)
+  destWallet    Wallet        @relation("TransactionDestination", fields: [destWalletId], references: [id], onDelete: Restrict)
+  originRequest MoneyRequest? @relation("MoneyRequestSettlement", fields: [originRequestId], references: [id], onDelete: Restrict)
+  reversalOf    Transaction?  @relation("TransactionReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy    Transaction?  @relation("TransactionReversal")
+
+  ledgerEntries LedgerEntry[]
+  events        TransactionEvent[]
+  riskFlags     RiskFlag[]
+
+  /// THE idempotency guarantee. ARCHITECTURE.md constraint C3.
+  @@unique([initiatorUserId, idempotencyKey])
+  /// Support and admin lookups ("show everything this wallet sent"). The
+  /// USER-FACING history path does NOT use these — it reads LedgerEntry,
+  /// which has one wallet per row and therefore one clean index. See
+  /// DATABASE.md "Why history reads the ledger".
+  @@index([sourceWalletId, createdAt(sort: Desc)])
+  @@index([destWalletId, createdAt(sort: Desc)])
+  /// Range scans for reporting, and the partition key when P2 arrives.
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+// ============================================================================
+//  LEDGER ENTRY — double-entry postings. The financial source of truth.
+//
+//  NOT in the originally requested table list, and the one table this design
+//  cannot lose. Every completed movement writes exactly two rows that sum to
+//  zero. `Wallet.balancePoisha` is derived from these; if the two disagree,
+//  the ledger wins and the wallet is frozen.
+//
+//  Immutable: hardening.sql installs a trigger that rejects UPDATE and DELETE
+//  outright, and the application role holds no UPDATE/DELETE grant.
+// ============================================================================
+
+model LedgerEntry {
+  id String @id @db.Uuid
+
+  transactionId String @map("transaction_id") @db.Uuid
+  walletId      String @map("wallet_id") @db.Uuid
+
+  /// Redundant with the sign of `amountPoisha` — deliberately. It makes
+  /// queries readable, makes the composite unique key meaningful, and the
+  /// CHECK in hardening.sql forces the two to agree, so the redundancy can
+  /// never become a disagreement.
+  direction LedgerDirection
+
+  /// SIGNED. Negative for DEBIT, positive for CREDIT, so that
+  /// `SUM(amount_poisha)` over any consistent set is exactly 0. That single
+  /// property is the system's health check (ARCHITECTURE.md §5).
+  amountPoisha BigInt @map("amount_poisha")
+
+  /// The wallet's balance immediately after this posting, captured while the
+  /// row lock is still held. Costs 8 bytes and buys statement rendering and
+  /// point-in-time debugging without replaying the whole ledger.
+  balanceAfterPoisha BigInt @map("balance_after_poisha")
+
+  currency String @default("BDT") @db.Char(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  wallet      Wallet      @relation(fields: [walletId], references: [id], onDelete: Restrict)
+
+  /// Structural guard against double-posting a leg: one transaction can post
+  /// at most one DEBIT and one CREDIT per wallet. A retry that slipped past
+  /// idempotency still cannot duplicate money.
+  @@unique([transactionId, walletId, direction])
+  /// THE transaction-history index. One wallet per row means this single
+  /// composite serves "my history, newest first" with no sort and no OR.
+  /// `id` is the tiebreaker that makes keyset pagination stable when two
+  /// entries share a timestamp.
+  @@index([walletId, createdAt(sort: Desc), id])
+  /// Fetch both legs of a movement; used by the reconciler and by support.
+  @@index([transactionId])
+  @@map("ledger_entries")
+}
+
+// ============================================================================
+//  TRANSACTION EVENT — lifecycle log AND transactional outbox
+//
+//  Two jobs, one table, deliberately (ARCHITECTURE.md §5 Figure 3):
+//    1. Append-only history of every state transition a Transaction made.
+//    2. The outbox — written INSIDE the money transaction, so an event exists
+//       if and only if the transfer committed. No dual-write window.
+//
+//  Merging them is what lets the architecture's separate `outbox` table
+//  disappear: identical grain, identical write moment, identical immutability.
+// ============================================================================
+
+model TransactionEvent {
+  /// BigInt autoincrement, not UUID. This table is a queue; the worker needs a
+  /// cheap monotonic order and the smallest possible index. Event rows are
+  /// never sharded by wallet, so the sharding argument for UUIDv7 does not
+  /// apply here.
+  id BigInt @id @default(autoincrement())
+
+  transactionId String @map("transaction_id") @db.Uuid
+
+  type TransactionEventType
+
+  /// The event body a consumer needs without re-reading the transaction:
+  /// amounts, both party names, the note. JSONB so consumers can evolve
+  /// without a migration. Snapshot semantics — never back-filled.
+  payload Json @db.JsonB
+
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  /// NULL until the outbox worker delivers it. The ONLY column on this table
+  /// the application role may UPDATE (column-level grant in hardening.sql).
+  /// Claimed with `FOR UPDATE SKIP LOCKED`, never with a high-water cursor —
+  /// bigserial ids can commit out of order, and a cursor would skip rows.
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(6)
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  /// Timeline for one transaction.
+  @@index([transactionId, occurredAt])
+  // Outbox claim uses a PARTIAL index `WHERE published_at IS NULL` from
+  // hardening.sql. That index stays tiny forever while this table grows to
+  // billions — the single most important index in the whole schema.
+  @@map("transaction_events")
+}
+
+// ============================================================================
+//  MONEY REQUEST — a claim, not money
+//
+//  ARCHITECTURE.md §5: this aggregate NEVER touches a balance. Only acceptance
+//  by the payer constructs a Transaction, which then goes through the same
+//  seven engine stages as a direct send. Keeping the request lifecycle out of
+//  the ledger is what stops "pending" from contaminating what a balance means.
+// ============================================================================
+
+model MoneyRequest {
+  id String @id @db.Uuid
+
+  /// Requests are idempotent too — a retried "ask Rahim for 500" must not
+  /// produce two claims in his inbox.
+  idempotencyKey String @map("idempotency_key") @db.VarChar(64)
+
+  /// Who is owed. Who will be paid.
+  requesterUserId String @map("requester_user_id") @db.Uuid
+  /// Who is being asked. `CHECK (requester <> payer)` in hardening.sql.
+  payerUserId     String @map("payer_user_id") @db.Uuid
+
+  amountPoisha BigInt  @map("amount_poisha")
+  currency     String  @default("BDT") @db.Char(3)
+  note         String? @db.VarChar(140)
+
+  status MoneyRequestStatus @default(REQUESTED)
+
+  /// A claim that never expires is a claim that accumulates forever. The
+  /// sweeper moves REQUESTED past this point to EXPIRED, using a partial
+  /// index so the sweep never scans settled rows.
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+
+  /// When it left REQUESTED, whichever terminal state it reached.
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz(6)
+
+  /// Notification bookkeeping. This deliberately does NOT use the outbox:
+  /// a money request moves no money, so an undelivered notification is a UX
+  /// incident, not a financial one, and does not justify a second queue.
+  notifiedAt DateTime? @map("notified_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  requester  User         @relation("MoneyRequestRequester", fields: [requesterUserId], references: [id], onDelete: Restrict)
+  payer      User         @relation("MoneyRequestPayer", fields: [payerUserId], references: [id], onDelete: Restrict)
+  /// Back-reference. The FK itself lives on Transaction.originRequestId.
+  settlement Transaction? @relation("MoneyRequestSettlement")
+
+  @@unique([requesterUserId, idempotencyKey])
+  /// The payer's inbox: "requests awaiting my action, newest first". The main
+  /// read path for this table.
+  @@index([payerUserId, status, createdAt(sort: Desc)])
+  /// "Requests I sent."
+  @@index([requesterUserId, createdAt(sort: Desc)])
+  @@map("money_requests")
+}
+
+// ============================================================================
+//  AUDIT LOG — who did what to the system
+//
+//  The third and last history table, on a different axis from the other two:
+//    LedgerEntry      → where is the money?          (financial truth)
+//    TransactionEvent → what happened to this move?  (lifecycle truth)
+//    AuditLog         → who did what, from where?    (actor truth)
+//
+//  Covers actions that move no money at all — login, PIN change, wallet freeze,
+//  admin override — which is precisely why it cannot be folded into either of
+//  the others.
+// ============================================================================
+
+model AuditLog {
+  id BigInt @id @default(autoincrement())
+
+  /// NULL when the actor is the platform itself (a sweeper, the reconciler).
+  /// `actorType` disambiguates rather than leaving a bare NULL to interpret.
+  actorUserId String?   @map("actor_user_id") @db.Uuid
+  actorType   ActorType @default(USER) @map("actor_type")
+
+  /// Dotted verb — `wallet.frozen`, `user.suspended`, `auth.login_failed`.
+  /// VarChar, not an enum: the audit vocabulary grows constantly, and an enum
+  /// would demand a migration for every new action.
+  action String @db.VarChar(64)
+
+  /// Polymorphic target. VarChar rather than Uuid because not every auditable
+  /// entity is UUID-keyed (TransactionEvent and AuditLog itself are BigInt).
+  /// No FK by design: audit rows must survive even if their subject is
+  /// archived out of the hot tables.
+  entityType String @map("entity_type") @db.VarChar(32)
+  entityId   String @map("entity_id") @db.VarChar(64)
+
+  /// State delta. Both NULL for pure reads; `before` NULL on creation.
+  before Json? @db.JsonB
+  after  Json? @db.JsonB
+
+  /// Forensics for account-takeover investigation. INET is a real PostgreSQL
+  /// type — it validates the value and supports subnet containment queries.
+  ipAddress String? @map("ip_address") @db.Inet
+  userAgent String? @map("user_agent") @db.VarChar(255)
+
+  /// Ties an audit row to the HTTP request that caused it, and to the log
+  /// lines and TransactionEvents from the same request.
+  correlationId String? @map("correlation_id") @db.Uuid
+
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  actor User? @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  /// "Everything this user did."
+  @@index([actorUserId, occurredAt(sort: Desc)])
+  /// "Everything that happened to this object."
+  @@index([entityType, entityId, occurredAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+//  RISK FLAG — asynchronous fraud/abuse detection
+//
+//  Fed by the TransactionEvent outbox, AFTER commit. It is not in the money
+//  path: ARCHITECTURE.md forbids network calls and slow work inside the
+//  transaction boundary, and a risk engine that can block a transfer is a
+//  risk engine that can take the platform down.
+//
+//  Hard limits that MUST block (per-transfer cap, daily velocity) are domain
+//  policy evaluated inside the use case against the same database. RiskFlag is
+//  for post-hoc detection and human review.
+// ============================================================================
+
+model RiskFlag {
+  id String @id @db.Uuid
+
+  /// The subject under suspicion. Always present — a flag is always about
+  /// someone, even when triggered by a specific transaction.
+  userId String @map("user_id") @db.Uuid
+
+  /// The movement that triggered it, when there was one. NULL for
+  /// account-level patterns (credential stuffing, device churn).
+  transactionId String? @map("transaction_id") @db.Uuid
+
+  /// Which detector fired — `velocity.hourly_count`, `pattern.circular_transfer`,
+  /// `amount.structuring`. VarChar for the same reason as `AuditLog.action`:
+  /// detection rules are added weekly.
+  rule String @db.VarChar(64)
+
+  severity RiskSeverity
+  status   RiskFlagStatus @default(OPEN)
+
+  /// The evidence: thresholds, observed values, the window examined. JSONB so
+  /// each rule stores the shape that makes its own decision reviewable.
+  details Json @db.JsonB
+
+  /// Review trail. Kept on the flag rather than in AuditLog because the
+  /// reviewer's verdict is part of the flag's own lifecycle.
+  reviewedByUserId String?   @map("reviewed_by_user_id") @db.Uuid
+  reviewedAt       DateTime? @map("reviewed_at") @db.Timestamptz(6)
+  resolutionNote   String?   @map("resolution_note") @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user        User         @relation("RiskSubject", fields: [userId], references: [id], onDelete: Restrict)
+  reviewer    User?        @relation("RiskReviewer", fields: [reviewedByUserId], references: [id], onDelete: Restrict)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  /// "Open flags against this user."
+  @@index([userId, status, createdAt(sort: Desc)])
+  /// "Why was this transaction flagged?"
+  @@index([transactionId])
+  // The analyst review queue uses a PARTIAL index `WHERE status = 'OPEN'`
+  // from hardening.sql — the queue is tiny, the table is not.
+  @@map("risk_flags")
+}
+
+// ============================================================================
+//  WALLET SECURITY EVENT — the freeze audit trail
+//
+//  Append-only history of every security transition a wallet went through.
+//  `wallets.status` is the CURRENT state (and the only thing enforced); this is
+//  HOW it got there.
+//
+//  Kept separate from `audit_logs` because the questions differ: audit answers
+//  "who did what across the platform", this answers "show me this wallet's
+//  security history" — a support screen that must not scan a table holding
+//  every login in the system.
+// ============================================================================
+
+model WalletSecurityEvent {
+  id BigInt @id @default(autoincrement())
+
+  walletId String               @map("wallet_id") @db.Uuid
+  action   WalletSecurityAction
+
+  /// State either side of the transition. Storing both makes the row
+  /// self-describing: a reader never has to replay earlier events to know what
+  /// changed.
+  previousStatus WalletStatus @map("previous_status")
+  newStatus      WalletStatus @map("new_status")
+
+  reason String @db.VarChar(200)
+
+  /// NULL when the platform acted on its own (a risk rule firing).
+  actorUserId String?   @map("actor_user_id") @db.Uuid
+  actorType   ActorType @default(USER) @map("actor_type")
+
+  ipAddress     String? @map("ip_address") @db.Inet
+  correlationId String? @map("correlation_id") @db.Uuid
+
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  actor  User?  @relation("WalletSecurityActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  /// "This wallet's security history, newest first" — the support view.
+  @@index([walletId, occurredAt(sort: Desc)])
+  @@map("wallet_security_events")
+}
+
+// ============================================================================
+//  POT — group money collection
+//
+//  THE DESIGN DECISION THAT MATTERS: a Pot OWNS A WALLET.
+//
+//  The tempting shortcut is a `currentAmount` counter on this table that
+//  contributions increment. That creates a SECOND money system — a balance the
+//  ledger knows nothing about, that reconciliation cannot check, and that can
+//  drift from reality with no way to detect it.
+//
+//  Instead a Pot has a real wallet (`type = POT`). A contribution is a real
+//  transfer through the Transaction Engine, with two balanced ledger postings,
+//  exactly like any peer-to-peer send. The pot's balance IS its wallet's
+//  balance, so `wallet_balance_drift` and `ledger_conservation_check` cover pot
+//  money for free — no new invariant, no new reconciliation job.
+// ============================================================================
+
+model Pot {
+  id String @id @db.Uuid
+
+  /// The wallet holding this pot's money. One-to-one, and the reason there is
+  /// no `currentAmount` column: the balance lives where every other balance
+  /// lives.
+  walletId String @unique @map("wallet_id") @db.Uuid
+
+  creatorUserId String @map("creator_user_id") @db.Uuid
+
+  /**
+   * Short, human-shareable code — how anyone actually JOINS a pot.
+   * Without a discovery mechanism a pot is unreachable: `GET /pots` only returns
+   * pots you already belong to, so a pot you create could never be found by the
+   * friends it exists to collect from.
+   * A code rather than an open directory, because a pot is private to a group.
+   * You join because someone shared the code with you over WhatsApp — the same
+   * way the group already coordinates — not because you browsed a list of
+   * strangers' trip funds.
+   * Alphabet excludes 0/O/1/I/L so a code read aloud or retyped is unambiguous.
+   */
+  inviteCode String @unique @map("invite_code") @db.VarChar(12)
+
+  name String  @db.VarChar(80)
+  note String? @db.VarChar(280)
+
+  /// What the group is collecting toward. Informational — contributions are
+  /// never rejected for exceeding it, because refusing someone's money because
+  /// the group over-collected is worse than a slightly over-funded trip.
+  targetPoisha BigInt @map("target_poisha")
+
+  currency String    @default("BDT") @db.Char(3)
+  status   PotStatus @default(OPEN)
+
+  /// Set on SETTLED, pointing at the payout transfer.
+  settlementTransactionId String?   @unique @map("settlement_transaction_id") @db.Uuid
+  settledAt               DateTime? @map("settled_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  wallet  Wallet      @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  creator User        @relation("PotCreator", fields: [creatorUserId], references: [id], onDelete: Restrict)
+  members PotMember[]
+
+  /// "Pots I created, newest first."
+  @@index([creatorUserId, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
+  @@map("pots")
+}
+
+// ============================================================================
+//  POT MEMBER — who is in, and how much they have put in
+// ============================================================================
+
+model PotMember {
+  id String @id @db.Uuid
+
+  potId  String @map("pot_id") @db.Uuid
+  userId String @map("user_id") @db.Uuid
+
+  /// Running total this member has contributed.
+  ///
+  /// A CACHE of their ledger postings into the pot wallet, maintained in the
+  /// same transaction as the contribution. It is a per-member breakdown, never
+  /// the source of the pot's balance — that is always the wallet.
+  contributedPoisha BigInt @default(0) @map("contributed_poisha")
+
+  contributionCount Int @default(0) @map("contribution_count")
+
+  joinedAt          DateTime  @default(now()) @map("joined_at") @db.Timestamptz(6)
+  lastContributedAt DateTime? @map("last_contributed_at") @db.Timestamptz(6)
+
+  pot  Pot  @relation(fields: [potId], references: [id], onDelete: Restrict)
+  user User @relation("PotMembership", fields: [userId], references: [id], onDelete: Restrict)
+
+  /// One membership per person per pot — enforced, not assumed.
+  @@unique([potId, userId])
+  /// "Pots I am a member of."
+  @@index([userId, joinedAt(sort: Desc)])
+  @@map("pot_members")
+}
+
+// ============================================================================
+//  EXPENSE ENVELOPE — reserved spending capacity
+//
+//  THE CENTRAL RULE: an envelope MOVES NO MONEY.
+//
+//  It reserves spending CAPACITY. The wallet balance is untouched, no ledger
+//  entry is written, and `ledger_conservation_check` is unaffected — because
+//  nothing was transferred. Reserving 5,000 for rent does not make the money
+//  leave; it makes the wallet refuse to spend below that floor.
+//
+//  That distinction is why this is not a sub-wallet. Sub-wallets would need
+//  their own postings, their own reconciliation, and transfers between
+//  envelopes would be real money movements. Reserved capacity needs none of
+//  that: it is a constraint on the debit, not a location for funds.
+// ============================================================================
+
+model ExpenseEnvelope {
+  id String @id @db.Uuid
+
+  walletId String @map("wallet_id") @db.Uuid
+
+  name     String  @db.VarChar(60)
+  category String? @db.VarChar(40)
+  /// Optional emoji/icon key for the UI. Presentation only.
+  icon     String? @db.VarChar(16)
+
+  /// How much spending capacity this envelope withholds. The sum of these
+  /// across a wallet is mirrored in `wallets.reserved_poisha`, which is what
+  /// the debit guard actually reads.
+  reservedPoisha BigInt @default(0) @map("reserved_poisha")
+
+  /// What the user is aiming to set aside. Progress display only — never
+  /// enforced, because a goal is an intention, not a constraint.
+  targetPoisha BigInt? @map("target_poisha")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Restrict)
+
+  /// One envelope per name per wallet — stops "Rent" and "Rent" both existing
+  /// and silently splitting a reservation.
+  @@unique([walletId, name])
+  @@index([walletId, createdAt])
+  @@map("expense_envelopes")
+}
+
+/// The catalogue of security questions. A closed set, so an enum.
+enum SecurityQuestionKey {
+  FIRST_SCHOOL
+  BEST_FRIEND_NAME
+  BIRTH_CITY
+  MOTHERS_MAIDEN_NAME
+  FIRST_PET
+  CHILDHOOD_NICKNAME
+}
+
+enum SecurityChallengePurpose {
+  /// A large transfer needs the owner to prove they are the owner.
+  TRANSFER
+  /// Releasing a frozen wallet. The attacker's last door.
+  UNFREEZE
+}
+
+enum SecurityChallengeStatus {
+  PENDING
+  PASSED
+  FAILED
+  EXPIRED
+}
+
+/// ============================================================================
+///  SECURITY ANSWER — the knowledge factor
+///
+///  Answers are HASHED with argon2id, exactly like passwords, and for the same
+///  reason: people reuse "mother's maiden name" across every site they own. A
+///  plaintext answer column would turn one database leak into a compromise of
+///  every other account those users hold.
+///
+///  Answers are normalised before hashing (trimmed, lowercased, inner
+///  whitespace collapsed) so "Dhaka" and " dhaka " match — otherwise the
+///  feature fails honest users far more often than attackers.
+/// ============================================================================
+model SecurityAnswer {
+  id String @id @db.Uuid
+
+  userId      String              @map("user_id") @db.Uuid
+  questionKey SecurityQuestionKey @map("question_key")
+
+  /// argon2id. Never the answer itself.
+  answerHash String @map("answer_hash") @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation("SecurityAnswers", fields: [userId], references: [id], onDelete: Restrict)
+
+  /// One answer per question per user.
+  @@unique([userId, questionKey])
+  @@index([userId])
+  @@map("security_answers")
+}
+
+/// ============================================================================
+///  SECURITY CHALLENGE — a single question, asked once, bound to one action
+///
+///  Stored in POSTGRES, not Redis, deliberately. Everything else ephemeral
+///  lives in Redis and fails OPEN when Redis is down — that is correct for a
+///  cache, and catastrophic for a security control. A challenge that silently
+///  stops being asked during a Redis outage is a bypass.
+///
+///  Durability also gives the audit trail: every failed answer is evidence.
+/// ============================================================================
+model SecurityChallenge {
+  id String @id @db.Uuid
+
+  userId      String                   @map("user_id") @db.Uuid
+  questionKey SecurityQuestionKey      @map("question_key")
+  purpose     SecurityChallengePurpose
+  status      SecurityChallengeStatus  @default(PENDING)
+
+  /// BINDS the challenge to one specific transfer.
+  ///
+  /// Without this an attacker could answer a challenge raised for a 100 BDT
+  /// transfer and reuse the pass for a 50,000 BDT one. The idempotency key and
+  /// amount must both match at redemption.
+  boundIdempotencyKey String? @map("bound_idempotency_key") @db.VarChar(64)
+  boundAmountPoisha   BigInt? @map("bound_amount_poisha")
+
+  /// Wrong answers on this challenge. A challenge is one shot on the transfer
+  /// path; unfreeze allows a few, then escalates to UNDER_REVIEW.
+  attemptCount Int @default(0) @map("attempt_count")
+
+  ipAddress     String? @map("ip_address") @db.Inet
+  correlationId String? @map("correlation_id") @db.Uuid
+
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation("SecurityChallenges", fields: [userId], references: [id], onDelete: Restrict)
+
+  /// "Is there a passed challenge for this transfer?" — the redemption lookup.
+  @@index([userId, purpose, status, createdAt(sort: Desc)])
+  @@index([boundIdempotencyKey])
+  @@map("security_challenges")
+}
